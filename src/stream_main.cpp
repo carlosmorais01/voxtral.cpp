@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <iostream>
@@ -115,6 +116,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // By default ggml-vulkan places buffers in host-visible VRAM (ReBAR). On
+    // AMD/RADV the driver may keep part of it in system memory, and a growing
+    // encoder graph then runs 5-10x slower past ~13 s of audio. Device-only
+    // memory keeps every step on the GPU.
+    setenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "1", 0);
+
     voxtral_log_callback logger = [](voxtral_log_level level, const std::string & msg) {
         if (level <= voxtral_log_level::warn) std::cerr << "voxtral: " << msg << "\n";
     };
@@ -167,14 +174,16 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (!file_audio.empty()) {
-        // Real-time pace: a chunk is fed only when its audio would have been spoken.
+        // Real-time pace, like the microphone: each step takes all the audio
+        // that would have been spoken by now (at least step_ms of it).
         while (ok && fed < file_audio.size()) {
-            const size_t n = std::min((size_t) step_samples, file_audio.size() - fed);
-            const double due = (double) (fed + n) / VOXTRAL_SAMPLE_RATE;
-            const double wait = due - seconds();
+            const size_t min_end = std::min(file_audio.size(), fed + (size_t) step_samples);
+            const double wait = (double) min_end / VOXTRAL_SAMPLE_RATE - seconds();
             if (wait > 0) std::this_thread::sleep_for(std::chrono::duration<double>(wait));
-            voxtral_stream_feed(s, file_audio.data() + fed, (int32_t) n);
-            fed += n;
+            const size_t spoken = (size_t) (seconds() * VOXTRAL_SAMPLE_RATE);
+            const size_t end = std::min(file_audio.size(), std::max(min_end, spoken));
+            voxtral_stream_feed(s, file_audio.data() + fed, (int32_t) (end - fed));
+            fed = end;
             ok = step(false);
         }
     } else {

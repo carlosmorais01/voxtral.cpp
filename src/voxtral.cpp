@@ -2220,7 +2220,8 @@ static bool run_encoder_offline(voxtral_context * ctx, const float * mel_data, i
     return true;
 }
 
-static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames) {
+static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames,
+                                int32_t rope_base = 0) {
     const int32_t mel_overlap = VOXTRAL_ENC_CHUNK_OVERLAP * 2;  // mel frames of overlap (1500)
     const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - mel_overlap;  // 1500
 
@@ -2277,7 +2278,7 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
             chunk_mel_ptr = chunk_mel_buf.data();
         }
 
-        int32_t rope_offset = enc_write_offset - skip;
+        int32_t rope_offset = rope_base + enc_write_offset - skip;
 
         // Run encoder for this chunk
         int32_t chunk_seq_len = 0;
@@ -2874,20 +2875,39 @@ bool voxtral_stream_step(voxtral_stream * s, bool final, std::string & text_out)
         used = n_raw;
         right_pad = (mult_of - (n_raw % mult_of)) % mult_of + VOXTRAL_N_RIGHT_PAD_TOKENS * mult_of;
     }
+    const int32_t total = left_pad + used + right_pad;
 
-    std::vector<float> padded((size_t) left_pad + used + right_pad, 0.0f);
-    if (used > 0) {
-        memcpy(padded.data() + left_pad, s->audio.data(), (size_t) used * sizeof(float));
+    // Only a window of the audio goes through mel + encoder: the decoder needs
+    // encoder outputs from its current position on, and each of them depends
+    // on at most VOXTRAL_ENC_WINDOW earlier encoder positions (the same
+    // overlap the chunked encoder discards). The window starts on a decoder
+    // token boundary, so its frames line up with the whole-audio ones.
+    constexpr int32_t enc_per_dec = VOXTRAL_DOWNSAMPLE_FACTOR;
+    constexpr int32_t samples_per_enc = mult_of / enc_per_dec;
+    int32_t start_enc = 0;
+    if (s->started) {
+        start_enc = std::max(0, s->next_pos * enc_per_dec - VOXTRAL_ENC_WINDOW);
+        start_enc = (start_enc / enc_per_dec) * enc_per_dec;
+    }
+    const int32_t start_dec = start_enc / enc_per_dec;
+    const int32_t start_sample = start_enc * samples_per_enc;
+
+    std::vector<float> window((size_t) (total - start_sample), 0.0f);
+    const int32_t audio_from = std::max(0, start_sample - left_pad);
+    const int32_t audio_to = used;
+    if (audio_to > audio_from) {
+        memcpy(window.data() + (left_pad + audio_from - start_sample), s->audio.data() + audio_from,
+               (size_t) (audio_to - audio_from) * sizeof(float));
     }
 
     int32_t n_frames = 0;
     std::vector<float> mel_data;
-    compute_mel_even(ctx, padded.data(), (int32_t) padded.size(), mel_data, n_frames);
-    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames) || !run_adapter(&ctx)) {
+    compute_mel_even(ctx, window.data(), (int32_t) window.size(), mel_data, n_frames);
+    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames, start_enc) || !run_adapter(&ctx)) {
         return false;
     }
 
-    const int32_t n_audio = ctx.dec_seq_len;
+    const int32_t n_audio = start_dec + ctx.dec_seq_len;
     const int32_t limit = final ? n_audio : n_audio - VOXTRAL_STREAM_MARGIN_TOKENS;
 
     if (!s->started) {
@@ -2913,7 +2933,7 @@ bool voxtral_stream_step(voxtral_stream * s, bool final, std::string & text_out)
         if (s->last_token == VOXTRAL_TOKEN_EOS) {
             break;
         }
-        if (!run_decoder_step(&ctx, s->last_token, s->next_pos, s->next_pos, nullptr, &s->last_token)) {
+        if (!run_decoder_step(&ctx, s->last_token, s->next_pos, s->next_pos - start_dec, nullptr, &s->last_token)) {
             return false;
         }
         s->tokens.push_back(s->last_token);
