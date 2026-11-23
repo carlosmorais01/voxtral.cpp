@@ -36,7 +36,11 @@
 #define VOXTRAL_DEC_HEAD_DIM    128
 #define VOXTRAL_DEC_HIDDEN      9216
 #define VOXTRAL_DEC_KV_HEADS    8
+// Decoder KV cache length, in 80 ms steps (8192 = ~11 min). Smaller saves VRAM:
+// the cache takes ~0.2 MB per step.
+#ifndef VOXTRAL_DEC_WINDOW
 #define VOXTRAL_DEC_WINDOW      8192
+#endif
 #define VOXTRAL_DEC_NORM_EPS    1e-5f
 #define VOXTRAL_DEC_ROPE_THETA  1000000.0f
 #define VOXTRAL_VOCAB_SIZE      131072

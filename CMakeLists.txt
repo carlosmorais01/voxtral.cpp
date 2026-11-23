@@ -44,6 +44,11 @@ endif()
 add_library(voxtral_lib
     src/voxtral.cpp)
 
+set(VOXTRAL_DEC_WINDOW "" CACHE STRING "Decoder KV cache length in 80 ms steps (default 8192)")
+if(VOXTRAL_DEC_WINDOW)
+    target_compile_definitions(voxtral_lib PUBLIC VOXTRAL_DEC_WINDOW=${VOXTRAL_DEC_WINDOW})
+endif()
+
 # On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
 # import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
 if(WIN32 AND BUILD_SHARED_LIBS)

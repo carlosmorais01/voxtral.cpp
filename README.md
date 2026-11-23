@@ -88,6 +88,24 @@ the machine's hardware concurrency; override with `--threads N`.
 
 ---
 
+## Streaming
+
+`voxtral-stream` transcribes while the audio arrives, word by word:
+
+```bash
+./tools/stream_mic.sh                       # live, from the default microphone
+./build/voxtral-stream --model models/voxtral/Q4_K_M.gguf --audio clip.wav --timestamps
+./build/voxtral-stream --model models/voxtral/Q4_K_M.gguf --server   # see src/stream_main.cpp
+```
+
+Each step re-runs mel + encoder over a bounded window of the audio (the encoder
+is causal with a 750-position window) and continues the decoder from where it
+stopped, so steps cost the same however long the utterance is. The streamed
+text matches the whole-file transcription. On AMD/RADV it sets
+`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`; without it the encoder slows down
+5-10x past ~13 s of audio. `-DVOXTRAL_DEC_WINDOW=2048` at configure time cuts
+the decoder cache from ~1.7 GB to ~0.4 GB (enough for ~2.7 min per utterance).
+
 ## Advanced Usage
 
 ### Manual Quantization

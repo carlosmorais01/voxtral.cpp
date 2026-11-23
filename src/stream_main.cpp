@@ -5,6 +5,15 @@
 // A WAV file, fed at real-time pace (to measure latency):
 //   ./build/voxtral-stream --model M --audio clip.wav [--timestamps]
 
+// Server mode (one process, many utterances; the model stays loaded):
+//   ./build/voxtral-stream --model M --server
+// stdin carries frames: 1 byte type + 4 bytes little-endian length + payload.
+//   'B' begin an utterance, 'A' audio (16 kHz mono s16le), 'E' end it (flush),
+//   'C' cancel it, 'Q' quit.
+// stdout gets one JSON object per line: {"ready":true} once the model is
+// loaded, {"partial":"..."} with the transcript so far whenever it grows,
+// {"final":"..."} after 'E', and {"error":"..."}.
+
 #include "voxtral.h"
 
 #include <algorithm>
@@ -13,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -29,6 +39,7 @@ struct options {
     voxtral_gpu_backend gpu        = voxtral_gpu_backend::auto_detect;
     int32_t             step_ms    = 240;
     bool                timestamps = false;
+    bool                server     = false;
 };
 
 bool parse_args(int argc, char ** argv, options & o) {
@@ -59,6 +70,8 @@ bool parse_args(int argc, char ** argv, options & o) {
             else return false;
         } else if (a == "--timestamps") {
             o.timestamps = true;
+        } else if (a == "--server") {
+            o.server = true;
         } else {
             return false;
         }
@@ -105,13 +118,161 @@ bool read_wav_16k_mono(const std::string & path, std::vector<float> & out) {
     return false;
 }
 
+
+std::string json_string(const std::string & text) {
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char) c;
+                }
+        }
+    }
+    return out + "\"";
+}
+
+void send_line(const std::string & key, const std::string & value) {
+    std::printf("{\"%s\":%s}\n", key.c_str(), value.c_str());
+    std::fflush(stdout);
+}
+
+bool read_exact(void * dst, size_t n) {
+    return std::fread(dst, 1, n, stdin) == n;
+}
+
+int run_server(voxtral_context * ctx, int32_t step_samples) {
+    struct event {
+        char               type;
+        std::vector<float> audio;
+    };
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<event> events;
+    bool closed = false;
+
+    std::thread reader([&]() {
+        std::vector<uint8_t> payload;
+        for (;;) {
+            uint8_t head[5];
+            if (!read_exact(head, sizeof(head))) break;
+            const uint32_t len = head[1] | (head[2] << 8) | (head[3] << 16) | ((uint32_t) head[4] << 24);
+            payload.resize(len);
+            if (len > 0 && !read_exact(payload.data(), len)) break;
+            event e{(char) head[0], {}};
+            if (e.type == 'A') {
+                e.audio.resize(len / 2);
+                for (size_t i = 0; i < e.audio.size(); i++) {
+                    e.audio[i] = (int16_t) (payload[2 * i] | (payload[2 * i + 1] << 8)) / 32768.0f;
+                }
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            events.push_back(std::move(e));
+            cv.notify_one();
+            if (head[0] == 'Q') break;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        closed = true;
+        cv.notify_one();
+    });
+
+    send_line("ready", "true");
+
+    voxtral_stream * s = nullptr;
+    std::string sent;
+    int32_t unstepped = 0;
+    bool quit = false;
+    while (!quit) {
+        std::deque<event> batch;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&]() { return closed || !events.empty(); });
+            if (events.empty() && closed) break;
+            batch.swap(events);
+        }
+        // Audio that piled up during a slow step goes into one step, so the
+        // transcript never falls behind the speech.
+        bool want_step = false;
+        for (event & e : batch) {
+            switch (e.type) {
+                case 'B':
+                    voxtral_stream_free(s);
+                    s = voxtral_stream_init(ctx);
+                    sent.clear();
+                    unstepped = 0;
+                    if (!s) send_line("error", json_string("could not start a stream"));
+                    break;
+                case 'A':
+                    if (s) {
+                        voxtral_stream_feed(s, e.audio.data(), (int32_t) e.audio.size());
+                        unstepped += (int32_t) e.audio.size();
+                        want_step = want_step || unstepped >= step_samples;
+                    }
+                    break;
+                case 'E': {
+                    if (!s) {
+                        send_line("final", json_string(""));
+                        break;
+                    }
+                    std::string text;
+                    if (!voxtral_stream_step(s, true, text)) {
+                        send_line("error", json_string("transcription failed"));
+                        text.clear();
+                    }
+                    send_line("final", json_string(text));
+                    voxtral_stream_free(s);
+                    s = nullptr;
+                    want_step = false;
+                    break;
+                }
+                case 'C':
+                    voxtral_stream_free(s);
+                    s = nullptr;
+                    want_step = false;
+                    break;
+                case 'Q':
+                    quit = true;
+                    break;
+                default:
+                    send_line("error", json_string(std::string("unknown frame ") + e.type));
+            }
+        }
+        if (want_step && s) {
+            std::string text;
+            unstepped = 0;
+            if (!voxtral_stream_step(s, false, text)) {
+                send_line("error", json_string("transcription failed"));
+                continue;
+            }
+            const size_t upto = complete_utf8_prefix(text);
+            if (upto > sent.size()) {
+                sent = text.substr(0, upto);
+                send_line("partial", json_string(sent));
+            }
+        }
+    }
+    voxtral_stream_free(s);
+    // The reader may still be blocked on stdin; the process is exiting anyway.
+    reader.detach();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
     options o;
     if (!parse_args(argc, argv, o)) {
         std::cerr << "usage: voxtral-stream --model M [--audio file.wav] [--gpu auto|vulkan|cuda|metal|none]\n"
-                     "                      [--step-ms 240] [--timestamps]\n"
+                     "                      [--step-ms 240] [--timestamps] [--server]\n"
                      "without --audio, reads raw 16 kHz mono s16le from stdin\n";
         return 1;
     }
@@ -133,6 +294,13 @@ int main(int argc, char ** argv) {
     cp.gpu = o.gpu;
     voxtral_context * ctx = voxtral_init_from_model(model, cp);
     if (!ctx) return 3;
+    const int32_t step_samples = VOXTRAL_SAMPLE_RATE * o.step_ms / 1000;
+    if (o.server) {
+        const int code = run_server(ctx, step_samples);
+        voxtral_free(ctx);
+        voxtral_model_free(model);
+        return code;
+    }
     voxtral_stream * s = voxtral_stream_init(ctx);
     if (!s) return 4;
 
@@ -142,7 +310,6 @@ int main(int argc, char ** argv) {
         return 5;
     }
 
-    const int32_t step_samples = VOXTRAL_SAMPLE_RATE * o.step_ms / 1000;
     if (o.audio.empty()) std::fprintf(stderr, "Pode falar (Ctrl+C para terminar).\n\n");
     size_t printed = 0;
     size_t fed = 0;
