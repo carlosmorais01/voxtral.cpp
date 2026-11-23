@@ -2805,3 +2805,123 @@ bool voxtral_transcribe_file(
     return voxtral_transcribe_from_audio(
         ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false);
 }
+
+// ============================================================================
+// Streaming API
+// ============================================================================
+//
+// The encoder is causal, so the encoder output for audio already seen does not
+// change when more audio arrives. Each step re-runs mel + encoder + adapter over
+// everything received so far (cheap on GPU) and only *continues* the decoder
+// from the last decoded position, reusing its KV cache.
+//
+// Two details keep earlier positions stable between steps:
+// - only whole 80 ms frames are used, so compute_mel_even always drops the
+//   same leading mel frame;
+// - the last few decoder positions are held back until more audio arrives,
+//   since the trailing mel frames still depend on the audio that follows.
+
+static constexpr int32_t VOXTRAL_STREAM_MARGIN_TOKENS = 2;
+
+struct voxtral_stream {
+    voxtral_context *    ctx = nullptr;
+    std::vector<float>   audio;
+    std::vector<int32_t> tokens;
+    int32_t              next_pos   = 0;
+    int32_t              last_token = 0;
+    bool                 started    = false;
+    bool                 done       = false;
+};
+
+voxtral_stream * voxtral_stream_init(voxtral_context * ctx) {
+    if (!ctx || ctx->model->hp.is_offline) {
+        return nullptr;
+    }
+    clear_kv_cache(ctx);
+    auto * s = new voxtral_stream();
+    s->ctx = ctx;
+    return s;
+}
+
+void voxtral_stream_free(voxtral_stream * s) {
+    delete s;
+}
+
+void voxtral_stream_feed(voxtral_stream * s, const float * samples, int32_t n_samples) {
+    if (s && samples && n_samples > 0) {
+        s->audio.insert(s->audio.end(), samples, samples + n_samples);
+    }
+}
+
+bool voxtral_stream_step(voxtral_stream * s, bool final, std::string & text_out) {
+    if (!s) {
+        return false;
+    }
+    voxtral_context & ctx = *s->ctx;
+    constexpr int32_t mult_of  = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    constexpr int32_t left_pad = VOXTRAL_N_LEFT_PAD_TOKENS * mult_of;
+    const int32_t L = 1 + VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS;
+
+    if (s->done) {
+        text_out = decode_tokens(*ctx.model, s->tokens);
+        return true;
+    }
+
+    const int32_t n_raw = (int32_t) s->audio.size();
+    int32_t used = (n_raw / mult_of) * mult_of;
+    int32_t right_pad = 0;
+    if (final) {
+        used = n_raw;
+        right_pad = (mult_of - (n_raw % mult_of)) % mult_of + VOXTRAL_N_RIGHT_PAD_TOKENS * mult_of;
+    }
+
+    std::vector<float> padded((size_t) left_pad + used + right_pad, 0.0f);
+    if (used > 0) {
+        memcpy(padded.data() + left_pad, s->audio.data(), (size_t) used * sizeof(float));
+    }
+
+    int32_t n_frames = 0;
+    std::vector<float> mel_data;
+    compute_mel_even(ctx, padded.data(), (int32_t) padded.size(), mel_data, n_frames);
+    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames) || !run_adapter(&ctx)) {
+        return false;
+    }
+
+    const int32_t n_audio = ctx.dec_seq_len;
+    const int32_t limit = final ? n_audio : n_audio - VOXTRAL_STREAM_MARGIN_TOKENS;
+
+    if (!s->started) {
+        if (limit < L) {
+            text_out.clear();
+            return true;
+        }
+        std::vector<int32_t> prompt_ids(L, VOXTRAL_TOKEN_STREAMING_PAD);
+        prompt_ids[0] = VOXTRAL_TOKEN_BOS;
+        std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
+        if (!run_decoder_prefill(&ctx, prompt_ids.data(), L - 1, logits.data())) {
+            return false;
+        }
+        if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, nullptr, &s->last_token)) {
+            return false;
+        }
+        s->tokens.push_back(s->last_token);
+        s->next_pos = L;
+        s->started = true;
+    }
+
+    for (; s->next_pos < limit; s->next_pos++) {
+        if (s->last_token == VOXTRAL_TOKEN_EOS) {
+            break;
+        }
+        if (!run_decoder_step(&ctx, s->last_token, s->next_pos, s->next_pos, nullptr, &s->last_token)) {
+            return false;
+        }
+        s->tokens.push_back(s->last_token);
+    }
+
+    if (final || s->last_token == VOXTRAL_TOKEN_EOS) {
+        s->done = true;
+    }
+    text_out = decode_tokens(*ctx.model, s->tokens);
+    return true;
+}

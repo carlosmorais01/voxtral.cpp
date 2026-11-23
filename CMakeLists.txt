@@ -87,6 +87,9 @@ endif()
 add_executable(voxtral src/main.cpp)
 target_link_libraries(voxtral PRIVATE voxtral_lib)
 
+add_executable(voxtral-stream src/stream_main.cpp)
+target_link_libraries(voxtral-stream PRIVATE voxtral_lib)
+
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
 target_link_libraries(voxtral-quantize PRIVATE ${VOXTRAL_GGML_TARGETS} Threads::Threads)
 target_include_directories(voxtral-quantize PRIVATE ${VOXTRAL_GGML_INCLUDES})

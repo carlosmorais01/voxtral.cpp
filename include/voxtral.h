@@ -152,6 +152,22 @@ bool voxtral_transcribe_audio(
     int32_t            max_tokens,
     voxtral_result   & result);
 
+// ============================================================================
+// Streaming API
+// ============================================================================
+//
+// Feed audio (16 kHz mono float) as it arrives and call voxtral_stream_step to
+// get the transcript so far. The last call should pass final = true to flush
+// the words still inside the model's delay. text_out is the full transcript up
+// to now; it only grows, but its last bytes may be an incomplete UTF-8 char.
+
+struct voxtral_stream;
+
+voxtral_stream * voxtral_stream_init(voxtral_context * ctx);
+void voxtral_stream_free(voxtral_stream * s);
+void voxtral_stream_feed(voxtral_stream * s, const float * samples, int32_t n_samples);
+bool voxtral_stream_step(voxtral_stream * s, bool final, std::string & text_out);
+
 #endif // __cplusplus
 
 #endif // VOXTRAL_H
