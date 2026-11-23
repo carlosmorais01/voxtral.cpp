@@ -1223,14 +1223,9 @@ static void clear_kv_cache(voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    void * k_data = ggml_get_data(ctx->kv_self_k);
-    void * v_data = ggml_get_data(ctx->kv_self_v);
-    if (k_data) {
-        memset(k_data, 0, ggml_nbytes(ctx->kv_self_k));
-    }
-    if (v_data) {
-        memset(v_data, 0, ggml_nbytes(ctx->kv_self_v));
-    }
+    // The cache may live in device memory (Vulkan/CUDA): go through the backend.
+    ggml_backend_tensor_memset(ctx->kv_self_k, 0, 0, ggml_nbytes(ctx->kv_self_k));
+    ggml_backend_tensor_memset(ctx->kv_self_v, 0, 0, ggml_nbytes(ctx->kv_self_v));
     ctx->kv_used = 0;
 }
 
@@ -1244,24 +1239,18 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
         return;
     }
 
-    uint8_t * k_data = (uint8_t *) ggml_get_data(ctx->kv_self_k);
-    uint8_t * v_data = (uint8_t *) ggml_get_data(ctx->kv_self_v);
-    if (!k_data || !v_data) {
-        return;
-    }
-
     const size_t row_bytes = ctx->kv_self_k->nb[1];
     const size_t layer_stride = ctx->kv_self_k->nb[2];
+    const size_t keep = (size_t) (window - shift) * row_bytes;
+    std::vector<uint8_t> tmp(keep);
 
     for (int32_t l = 0; l < ctx->model->hp.dec_layers; ++l) {
-        uint8_t * k_base = k_data + (size_t) l * layer_stride;
-        uint8_t * v_base = v_data + (size_t) l * layer_stride;
-
-        memmove(k_base, k_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
-        memmove(v_base, v_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
-
-        memset(k_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
-        memset(v_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
+        const size_t base = (size_t) l * layer_stride;
+        for (ggml_tensor * t : {ctx->kv_self_k, ctx->kv_self_v}) {
+            ggml_backend_tensor_get(t, tmp.data(), base + (size_t) shift * row_bytes, keep);
+            ggml_backend_tensor_set(t, tmp.data(), base, keep);
+            ggml_backend_tensor_memset(t, 0, base + keep, (size_t) shift * row_bytes);
+        }
     }
 }
 
